@@ -223,5 +223,9 @@ __marimo__/
 D_xxxJ_BSM_*_v1.0.1_test.xlsm
 *_2.xlsx
 
+# Excel files
+*.xlsx
+*.xlsm
+
 # Streamlit
 .streamlit/secrets.toml
