@@ -70,6 +70,8 @@ class JudgementResult(BaseModel):
 	should_append: bool
 	reason: str
 	confidence: str
+	needs_user_input: bool
+	question: str
 
 
 class ResponseGenerator:
@@ -138,6 +140,20 @@ class MissingCandidate:
 
 
 @dataclass(frozen=True)
+class PendingQuestion:
+	candidate_key: str
+	row_idx: int
+	condition_no: str
+	condition_name: str
+	major_code: str
+	major_name: str
+	detail_code: str
+	detail_name: str
+	basis: str
+	question: str
+
+
+@dataclass(frozen=True)
 class StandardDetailRecord:
 	major_code: str
 	standardized: bool
@@ -183,6 +199,20 @@ class VSIToolInput:
 		for ch in col_letters:
 			col_idx = col_idx * 26 + (ord(ch) - ord("A") + 1)
 		return ref_ws.cell(row=row_idx, column=col_idx).value
+
+	@staticmethod
+	def _resolve_display_value(value: Any, ws: Worksheet, row_idx: int) -> Any:
+		"""表示向けの値を返す。単純参照と ROW() 系数式を解決する。"""
+		resolved = VSIToolInput._resolve_simple_cell_reference(value, ws)
+		text = "" if resolved is None else str(resolved).strip()
+		m = re.match(r"^=\s*ROW\(\)\s*([+-]\s*\d+)?\s*$", text, flags=re.IGNORECASE)
+		if not m:
+			return resolved
+		offset_text = m.group(1)
+		offset = 0
+		if offset_text:
+			offset = int(re.sub(r"\s+", "", offset_text))
+		return row_idx + offset
 
 	@staticmethod
 	def _normalize_major_code(raw: Any) -> str:
@@ -250,15 +280,21 @@ class VSIToolInput:
 		condition_name: str,
 		condition_basis: str,
 		detail_name: str,
+		user_answer: str = "",
 		reasoning_effort: str = "medium",
-	) -> Tuple[bool, str, str]:
+	) -> Tuple[bool, str, str, bool, str]:
+		additional_context = ""
+		if user_answer:
+			additional_context = f"\n- ユーザ追加情報: {user_answer}"
+
 		prompt = f"""## 役割
 車両条件の設定基準に対して、候補細目名称が追記対象かを判定してください。
 
 ## 判定ルール
 - 設定基準に合致すると判断できる場合のみ should_append=true
-- 判断根拠が不足する場合は false
+- 判断根拠が不足する場合は needs_user_input=true とし、確認質問を返す
 - 推測ではなく、与えられた文のみで判断
+- 前提知識: 全ての大分類で細目コード "I" は "W/O" を意味し、Without（当該装備なし）を示す
 - 細目名称のW/OはWithoutを意味しており、その大分類仕様が装備されないことを指す
 - confidence は以下のみを返す
   - High: 記載方法に従って判断できる場合
@@ -268,11 +304,14 @@ class VSIToolInput:
 - 車両条件名称: {condition_name}
 - 条件の設定基準: {condition_basis}
 - 候補細目名称: {detail_name}
+{additional_context}
 
 ## 出力
 - should_append: true/false
 - reason: 1文で根拠
 - confidence: High/Low
+- needs_user_input: true/false
+- question: 判断不能時にユーザへ確認したい内容（判断可能時は空文字）
 """
 		messages = [{"role": "user", "content": prompt}]
 		result: Optional[JudgementResult] = self.rg.create_format_response(
@@ -283,9 +322,19 @@ class VSIToolInput:
 		)
 
 		if result is None:
-			return False, "LLM判定失敗", "Low"
+			return False, "LLM判定失敗", "Low", True, "判定に必要な追加情報を入力してください。"
 		confidence = "High" if str(result.confidence).strip().lower() == "high" else "Low"
-		return result.should_append, result.reason, confidence
+		needs_user_input = bool(result.needs_user_input)
+		question = self._normalize_text(result.question)
+		if needs_user_input and not question:
+			question = "判定に必要な追加情報を入力してください。"
+		if not needs_user_input:
+			question = ""
+		return result.should_append, result.reason, confidence, needs_user_input, question
+
+	@staticmethod
+	def _candidate_key(cand: MissingCandidate) -> str:
+		return f"{cand.row_idx}|{cand.condition_no}|{cand.major_code}|{cand.detail_code}|{cand.detail_col}"
 
 	@staticmethod
 	def _write_judgement_sheet(wb_vehicle, judgement_rows: List[Dict[str, Any]]) -> None:
@@ -304,6 +353,11 @@ class VSIToolInput:
 			"detail_code",
 			"detail_name",
 			"basis",
+			"needs_user_input",
+			"question",
+			"user_answer",
+			"used_user_input",
+			"finalized",
 			"should_append",
 			"reason",
 			"confidence",
@@ -321,7 +375,9 @@ class VSIToolInput:
 		ws_judgement.column_dimensions["E"].width = pixels_to_width(241)
 		ws_judgement.column_dimensions["G"].width = pixels_to_width(244)
 		ws_judgement.column_dimensions["H"].width = pixels_to_width(441)
-		ws_judgement.column_dimensions["J"].width = pixels_to_width(703)
+		ws_judgement.column_dimensions["J"].width = pixels_to_width(585)  # question
+		ws_judgement.column_dimensions["K"].width = pixels_to_width(270)  # user_answer
+		ws_judgement.column_dimensions["O"].width = pixels_to_width(600)  # reason
 
 		last_row = ws_judgement.max_row
 		last_col = ws_judgement.max_column
@@ -334,7 +390,7 @@ class VSIToolInput:
 				cell.alignment = wrap_alignment
 				cell.border = all_border
 
-		table_ref = f"A1:K{last_row}"
+		table_ref = f"A1:P{last_row}"
 		table = Table(displayName="LLMJudgementTable", ref=table_ref)
 		table.tableStyleInfo = TableStyleInfo(
 			name="TableStyleMedium2",
@@ -370,6 +426,39 @@ class VSIToolInput:
 
 		for item in standard_check_rows:
 			ws_check.append([item.get(col, "") for col in headers])
+
+		# 指定ピクセル幅を openpyxl の列幅（文字数ベース）に変換する。
+		def pixels_to_width(px: int) -> float:
+			return max(0.0, (px - 5) / 7)
+
+		ws_check.column_dimensions["B"].width = pixels_to_width(144)  # category
+		ws_check.column_dimensions["E"].width = pixels_to_width(260)  # vsi_detail_name
+		ws_check.column_dimensions["F"].width = pixels_to_width(260)  # standard_name_en
+		ws_check.column_dimensions["G"].width = pixels_to_width(260)  # standard_name_kana
+		ws_check.column_dimensions["J"].width = pixels_to_width(180)  # vehicle_condition_name
+		ws_check.column_dimensions["K"].width = pixels_to_width(512)  # message
+
+		last_row = ws_check.max_row
+		last_col = ws_check.max_column
+		wrap_alignment = Alignment(wrap_text=True, vertical="top")
+		thin = Side(style="thin", color="000000")
+		all_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+		for row in ws_check.iter_rows(min_row=1, max_row=last_row, min_col=1, max_col=last_col):
+			for cell in row:
+				cell.alignment = wrap_alignment
+				cell.border = all_border
+
+		table_ref = f"A1:K{last_row}"
+		table = Table(displayName="StandardCheckTable", ref=table_ref)
+		table.tableStyleInfo = TableStyleInfo(
+			name="TableStyleMedium2",
+			showFirstColumn=False,
+			showLastColumn=False,
+			showRowStripes=True,
+			showColumnStripes=False,
+		)
+		ws_check.add_table(table)
 
 	def _unmerge_and_fill_for_title_rows(self, ws: Worksheet, start_row: int = 9, end_row: int = 11) -> None:
 		target_ranges = []
@@ -542,10 +631,14 @@ class VSIToolInput:
 		caution_count = 0
 		condition_sets = [4, 7, 10, 13, 16]  # D/G/J/M/P
 		for row in range(2, ws_vehicle.max_row + 1):
-			condition_name = self._normalize_text(ws_vehicle.cell(row=row, column=2).value)
+			condition_name = self._normalize_text(
+				self._resolve_display_value(ws_vehicle.cell(row=row, column=2).value, ws_vehicle, row)
+			)
 			if not condition_name:
 				break
-			condition_no = self._normalize_text(ws_vehicle.cell(row=row, column=1).value)
+			condition_no = self._normalize_text(
+				self._resolve_display_value(ws_vehicle.cell(row=row, column=1).value, ws_vehicle, row)
+			)
 
 			for major_col in condition_sets:
 				detail_col = major_col + 1
@@ -584,9 +677,9 @@ class VSIToolInput:
 		result: Dict[str, str] = {}
 		empty_streak = 0
 		for row in range(2, ws_basis.max_row + 1):
-			raw_no = self._resolve_simple_cell_reference(ws_basis.cell(row=row, column=1).value, ws_basis)
-			raw_name = self._resolve_simple_cell_reference(ws_basis.cell(row=row, column=2).value, ws_basis)
-			raw_basis = self._resolve_simple_cell_reference(ws_basis.cell(row=row, column=3).value, ws_basis)
+			raw_no = self._resolve_display_value(ws_basis.cell(row=row, column=1).value, ws_basis, row)
+			raw_name = self._resolve_display_value(ws_basis.cell(row=row, column=2).value, ws_basis, row)
+			raw_basis = self._resolve_display_value(ws_basis.cell(row=row, column=3).value, ws_basis, row)
 
 			no = self._normalize_text(raw_no)
 			name = self._normalize_text(raw_name)
@@ -620,12 +713,16 @@ class VSIToolInput:
 		condition_sets = [4, 7, 10, 13, 16]  # D/G/J/M/P
 
 		for row in range(2, ws_vehicle.max_row + 1):
-			condition_name = self._normalize_text(ws_vehicle.cell(row=row, column=2).value)
+			condition_name = self._normalize_text(
+				self._resolve_display_value(ws_vehicle.cell(row=row, column=2).value, ws_vehicle, row)
+			)
 			if not condition_name:
 				# 車両条件が空になった時点でデータ終端とみなす。
 				break
 
-			condition_no = self._normalize_text(ws_vehicle.cell(row=row, column=1).value)
+			condition_no = self._normalize_text(
+				self._resolve_display_value(ws_vehicle.cell(row=row, column=1).value, ws_vehicle, row)
+			)
 			condition_basis = basis_map.get(f"NO:{condition_no}", "")
 			if not condition_basis:
 				condition_basis = basis_map.get(f"NAME:{condition_name}", "")
@@ -674,6 +771,7 @@ class VSIToolInput:
 		country_spec_file: BytesIO,
 		vehicle_info_file: BytesIO,
 		standard_master_file: Optional[BytesIO] = None,
+		user_answers: Optional[Dict[str, str]] = None,
 		reasoning_effort: str = "medium",
 	) -> Tuple[bytes, str, List[Dict[str, Any]], Dict[str, Any]]:
 		# 全体フロー:
@@ -723,38 +821,70 @@ class VSIToolInput:
 			memo.append("標準大分類/細目一覧: 未指定のためチェックをスキップ")
 
 		judgement_rows: List[Dict[str, Any]] = []
+		pending_questions: List[PendingQuestion] = []
 		appended_count = 0
 		llm_call_count = 0
-		llm_cache: Dict[Tuple[str, str, str, str], Tuple[bool, str, str]] = {}
+		used_user_input_count = 0
+		answers = user_answers or {}
+		llm_cache: Dict[Tuple[str, str, str, str, str], Tuple[bool, str, str, bool, str]] = {}
 
 		# STEP5: 候補ごとにLLMで追記要否を判定し、trueのみ反映する。
 		for cand in missing_candidates:
+			candidate_key = self._candidate_key(cand)
+			user_answer = self._normalize_text(answers.get(candidate_key, ""))
 			cache_key = (
 				cand.condition_name,
 				cand.condition_basis,
 				cand.detail_name,
+				user_answer,
 				reasoning_effort,
 			)
 			cached = llm_cache.get(cache_key)
 			if cached is not None:
-				should_append, reason, confidence = cached
+				should_append, reason, confidence, needs_user_input, question = cached
 			else:
 				if llm_call_count >= self.max_llm_calls:
 					should_append = False
 					reason = f"LLM呼び出し上限({self.max_llm_calls})到達のため未判定"
 					confidence = "Low"
+					needs_user_input = True
+					question = "判定に必要な追加情報を入力してください。"
 				else:
-					should_append, reason, confidence = self._llm_should_append(
+					should_append, reason, confidence, needs_user_input, question = self._llm_should_append(
 						condition_name=cand.condition_name,
 						condition_basis=cand.condition_basis,
 						detail_name=cand.detail_name,
+						user_answer=user_answer,
 						reasoning_effort=reasoning_effort,
 					)
 					llm_call_count += 1
-				llm_cache[cache_key] = (should_append, reason, confidence)
+				llm_cache[cache_key] = (should_append, reason, confidence, needs_user_input, question)
+
+			finalized = True
+			if needs_user_input and not user_answer:
+				finalized = False
+				pending_questions.append(
+					PendingQuestion(
+						candidate_key=candidate_key,
+						row_idx=cand.row_idx,
+						condition_no=cand.condition_no,
+						condition_name=cand.condition_name,
+						major_code=cand.major_code,
+						major_name=cand.major_name,
+						detail_code=cand.detail_code,
+						detail_name=cand.detail_name,
+						basis=cand.condition_basis,
+						question=question,
+					)
+				)
+
+			used_user_input = bool(user_answer and finalized)
+			if used_user_input:
+				used_user_input_count += 1
 
 			judgement_rows.append(
 				{
+					"candidate_key": candidate_key,
 					"row": cand.row_idx,
 					"condition_no": cand.condition_no,
 					"condition_name": cand.condition_name,
@@ -763,13 +893,18 @@ class VSIToolInput:
 					"detail_code": cand.detail_code,
 					"detail_name": cand.detail_name,
 					"basis": cand.condition_basis,
+					"needs_user_input": needs_user_input,
+					"question": question,
+					"user_answer": user_answer,
+					"used_user_input": used_user_input,
+					"finalized": finalized,
 					"should_append": should_append,
 					"reason": reason,
 					"confidence": confidence,
 				}
 			)
 
-			if not should_append:
+			if not finalized or not should_append:
 				continue
 
 			current_value = ws_vehicle.cell(row=cand.row_idx, column=cand.detail_col).value
@@ -786,6 +921,8 @@ class VSIToolInput:
 		memo.append(f"追記件数: {appended_count}")
 		memo.append(f"LLM実呼び出し件数: {llm_call_count}")
 		memo.append(f"LLMキャッシュ件数: {len(llm_cache)}")
+		memo.append(f"要ユーザ確認件数(未確定): {len(pending_questions)}")
+		memo.append(f"ユーザ追加情報を使用した判定件数: {used_user_input_count}")
 
 		# 画面表示用に、比較情報を大分類単位で再集約する。
 		details_by_major: Dict[str, Dict[str, Any]] = {}
@@ -817,7 +954,24 @@ class VSIToolInput:
 		# 正しくはdetail_col = major_col + 1
 		# E(5)がD(4)の細目、H(8)がG(7)の細目...
 
-		details_info = {"by_major_code": details_by_major}
+		details_info = {
+			"by_major_code": details_by_major,
+			"pending_questions": [
+				{
+					"candidate_key": q.candidate_key,
+					"row": q.row_idx,
+					"condition_no": q.condition_no,
+					"condition_name": q.condition_name,
+					"major_code": q.major_code,
+					"major_name": q.major_name,
+					"detail_code": q.detail_code,
+					"detail_name": q.detail_name,
+					"basis": q.basis,
+					"question": q.question,
+				}
+				for q in pending_questions
+			],
+		}
 		details_info["standard_checks"] = standard_check_rows
 
 		# ダウンロードExcelに画面表示と同じ判定結果を別シートで追加する。
@@ -839,6 +993,49 @@ class VSIToolInput:
 		return out.getvalue(), "\n".join(memo), judgement_rows, details_info
 
 
+def _aggregate_pending_questions(pending_questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+	"""同一質問文の確認事項を集約し、回答入力件数を減らす。"""
+	groups: Dict[str, Dict[str, Any]] = {}
+	for item in pending_questions:
+		question = str(item.get("question", "")).strip() or "判定に必要な追加情報を入力してください。"
+		bucket = groups.get(question)
+		if bucket is None:
+			bucket = {
+				"question": question,
+				"candidate_keys": [],
+				"targets": [],
+			}
+			groups[question] = bucket
+
+		candidate_key = str(item.get("candidate_key", "")).strip()
+		if candidate_key:
+			bucket["candidate_keys"].append(candidate_key)
+
+		target = (
+			f"Row {item.get('row', '')} / No {item.get('condition_no', '')} / "
+			f"{item.get('condition_name', '')} / {item.get('major_code', '')}:{item.get('detail_code', '')}"
+		)
+		bucket["targets"].append(target)
+
+	grouped = sorted(groups.values(), key=lambda x: (-len(x["candidate_keys"]), x["question"]))
+	results: List[Dict[str, Any]] = []
+	for idx, group in enumerate(grouped, start=1):
+		targets = group["targets"]
+		preview = " / ".join(targets[:3])
+		if len(targets) > 3:
+			preview += f" / ... 他{len(targets) - 3}件"
+		results.append(
+			{
+				"group_key": f"G{idx:04d}",
+				"question": group["question"],
+				"candidate_keys": group["candidate_keys"],
+				"count": len(group["candidate_keys"]),
+				"targets_preview": preview,
+			}
+		)
+	return results
+
+
 def main() -> None:
 	logger = setup_logger()
 	st.set_page_config(page_title="VSI Tool Input", layout="wide")
@@ -856,6 +1053,18 @@ def main() -> None:
 		st.session_state["output_bytes"] = None
 	if "details_info" not in st.session_state:
 		st.session_state["details_info"] = {}
+	if "pending_answers" not in st.session_state:
+		st.session_state["pending_answers"] = {}
+	if "aggregated_answers" not in st.session_state:
+		st.session_state["aggregated_answers"] = {}
+	if "aggregate_questions_mode" not in st.session_state:
+		st.session_state["aggregate_questions_mode"] = False
+	if "country_file_bytes" not in st.session_state:
+		st.session_state["country_file_bytes"] = None
+	if "vehicle_file_bytes" not in st.session_state:
+		st.session_state["vehicle_file_bytes"] = None
+	if "standard_master_file_bytes" not in st.session_state:
+		st.session_state["standard_master_file_bytes"] = None
 	if "logger" not in st.session_state:
 		st.session_state["logger"] = logger
 
@@ -902,25 +1111,38 @@ def main() -> None:
 		st.session_state["judgement_rows"] = []
 		st.session_state["output_bytes"] = None
 		st.session_state["details_info"] = {}
+		st.session_state["pending_answers"] = {}
+		st.session_state["aggregated_answers"] = {}
+		st.session_state["aggregate_questions_mode"] = False
+		st.session_state["country_file_bytes"] = None
+		st.session_state["vehicle_file_bytes"] = None
+		st.session_state["standard_master_file_bytes"] = None
 		st.success("表示結果をリセットしました")
 
 	memo_text = st.session_state["memo_text"]
 	judgement_rows = st.session_state["judgement_rows"]
 	output_bytes = st.session_state["output_bytes"]
 	details_info = st.session_state["details_info"]
+	pending_answers = st.session_state["pending_answers"]
 	processing_done = False
 
 	if run:
 		if country_file is None or vehicle_file is None:
 			st.warning("2つのExcelファイルを選択してください。")
 		else:
+			st.session_state["country_file_bytes"] = country_file.read()
+			st.session_state["vehicle_file_bytes"] = vehicle_file.read()
+			st.session_state["standard_master_file_bytes"] = (
+				standard_master_file.read() if standard_master_file is not None else None
+			)
 			# 実行時のみ入力ファイルを読み、完了後に結果をsessionへ保存する。
 			with st.spinner("処理中です..."):
 				try:
 					output_bytes, memo_text, judgement_rows, details_info = st.session_state["tool"].run(
-						country_spec_file=BytesIO(country_file.read()),
-						vehicle_info_file=BytesIO(vehicle_file.read()),
-						standard_master_file=BytesIO(standard_master_file.read()) if standard_master_file is not None else None,
+						country_spec_file=BytesIO(st.session_state["country_file_bytes"]),
+						vehicle_info_file=BytesIO(st.session_state["vehicle_file_bytes"]),
+						standard_master_file=BytesIO(st.session_state["standard_master_file_bytes"]) if st.session_state["standard_master_file_bytes"] is not None else None,
+						user_answers=pending_answers,
 						reasoning_effort=st.session_state["reasoning_effort"],
 					)
 					st.session_state["output_bytes"] = output_bytes
@@ -934,6 +1156,110 @@ def main() -> None:
 			
 			if processing_done:
 				st.success("✅ 実行完了しました")
+
+	pending_questions = details_info.get("pending_questions", []) if details_info else []
+	if pending_questions:
+		st.subheader("確認事項（判断不能項目）")
+		st.caption("未確定項目への回答を入力し、再判定を実行してください。")
+
+		toggle_col1, toggle_col2 = st.columns([1, 1])
+		with toggle_col1:
+			enable_aggregate = st.button("確認事項を集約表示", key="toggle_aggregate_questions")
+		with toggle_col2:
+			disable_aggregate = st.button("個別表示に戻す", key="toggle_individual_questions")
+
+		if enable_aggregate:
+			st.session_state["aggregate_questions_mode"] = True
+		if disable_aggregate:
+			st.session_state["aggregate_questions_mode"] = False
+
+		if st.session_state["aggregate_questions_mode"]:
+			aggregated = _aggregate_pending_questions(pending_questions)
+			st.info(f"集約表示: {len(pending_questions)}件の確認事項を {len(aggregated)}件に集約しています。")
+			for group in aggregated:
+				st.markdown(f"**集約質問 ({group['count']}件)**")
+				st.write(f"確認質問: {group['question']}")
+				st.caption(f"対象: {group['targets_preview']}")
+				group_key = group["group_key"]
+				st.session_state["aggregated_answers"][group_key] = st.text_area(
+					"回答（この集約質問の対象へ同じ回答を適用）",
+					value=st.session_state["aggregated_answers"].get(group_key, ""),
+					key=f"group_answer_{group_key}",
+					height=80,
+				)
+
+			reask_grouped = st.button("集約回答を反映して再判定", type="primary", key="reask_grouped")
+			if reask_grouped:
+				if st.session_state["country_file_bytes"] is None or st.session_state["vehicle_file_bytes"] is None:
+					st.warning("先に実行を行い、確認事項を生成してください。")
+				else:
+					merged_answers = dict(pending_answers)
+					for group in aggregated:
+						group_key = group["group_key"]
+						group_answer = str(st.session_state["aggregated_answers"].get(group_key, "")).strip()
+						if not group_answer:
+							continue
+						for candidate_key in group["candidate_keys"]:
+							merged_answers[candidate_key] = group_answer
+					st.session_state["pending_answers"] = merged_answers
+
+					with st.spinner("集約回答を反映して再判定中..."):
+						try:
+							output_bytes, memo_text, judgement_rows, details_info = st.session_state["tool"].run(
+								country_spec_file=BytesIO(st.session_state["country_file_bytes"]),
+								vehicle_info_file=BytesIO(st.session_state["vehicle_file_bytes"]),
+								standard_master_file=BytesIO(st.session_state["standard_master_file_bytes"]) if st.session_state["standard_master_file_bytes"] is not None else None,
+								user_answers=merged_answers,
+								reasoning_effort=st.session_state["reasoning_effort"],
+							)
+							st.session_state["output_bytes"] = output_bytes
+							st.session_state["memo_text"] = memo_text
+							st.session_state["judgement_rows"] = judgement_rows
+							st.session_state["details_info"] = details_info
+							st.success("✅ 集約回答を反映して再判定しました")
+						except Exception as exc:
+							st.session_state["logger"].exception("集約再判定中エラー")
+							st.error(f"集約再判定中にエラーが発生しました: {exc}")
+		else:
+			for q in pending_questions:
+				caption = (
+					f"Row {q.get('row', '')} / 条件No {q.get('condition_no', '')} / 車両条件名 {q.get('condition_name', '')} / "
+					f"{q.get('major_code', '')}:{q.get('detail_code', '')} {q.get('detail_name', '')}"
+				)
+				st.markdown(f"**{caption}**")
+				st.write(f"確認質問: {q.get('question', '')}")
+				answer_key = q.get("candidate_key", "")
+				if not answer_key:
+					continue
+				pending_answers[answer_key] = st.text_area(
+					"回答",
+					value=self_value if (self_value := pending_answers.get(answer_key, "")) else "",
+					key=f"answer_{answer_key}",
+					height=80,
+				)
+
+			reask = st.button("回答を反映して再判定", type="primary", key="reask_individual")
+			if reask:
+				if st.session_state["country_file_bytes"] is None or st.session_state["vehicle_file_bytes"] is None:
+					st.warning("先に実行を行い、確認事項を生成してください。")
+				else:
+					with st.spinner("回答を反映して再判定中..."):
+						try:
+							output_bytes, memo_text, judgement_rows, details_info = st.session_state["tool"].run(
+								country_spec_file=BytesIO(st.session_state["country_file_bytes"]),
+								vehicle_info_file=BytesIO(st.session_state["vehicle_file_bytes"]),
+								standard_master_file=BytesIO(st.session_state["standard_master_file_bytes"]) if st.session_state["standard_master_file_bytes"] is not None else None,
+								user_answers=pending_answers,
+								reasoning_effort=st.session_state["reasoning_effort"],
+							)
+							st.session_state["output_bytes"] = output_bytes
+							st.session_state["memo_text"] = memo_text
+							st.session_state["judgement_rows"] = judgement_rows
+							st.session_state["details_info"] = details_info
+							st.success("✅ 回答を反映して再判定しました")
+						except Exception as exc:
+							st.session_state["logger"].exception("再判定中エラー")
+							st.error(f"再判定中にエラーが発生しました: {exc}")
 
 	col1, col2 = st.columns([1, 2], gap="large")
 
