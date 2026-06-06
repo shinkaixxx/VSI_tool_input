@@ -219,5 +219,9 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Local test/output Excel files
+D_xxxJ_BSM_*_v1.0.1_test.xlsm
+*_2.xlsx
+
 # Streamlit
 .streamlit/secrets.toml
